@@ -1,0 +1,185 @@
+import json
+import os
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
+
+from litellm import completion
+from typing import List, Dict
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TARGET_DIR = os.path.dirname(BASE_DIR)
+BLOCKED_FILES = {".env"}
+
+
+def list_files(directory: str = "") -> Dict:
+    """Lists files inside the project folder, or a subfolder of it."""
+    path = os.path.join(TARGET_DIR, directory) if directory else TARGET_DIR
+    try:
+        return {"files": os.listdir(path)}
+    except Exception as e:
+        return {"error": f"Could not list '{directory or 'top-level folder'}': {str(e)}. Call list_files with no directory to see the available top-level folders."}
+
+
+def read_file(file_name: str) -> Dict:
+    """Reads a file's contents. Refuses to read blocked files like .env."""
+    if os.path.basename(file_name) in BLOCKED_FILES:
+        return {"error": "Reading this file is not permitted."}
+
+    file_path = os.path.join(TARGET_DIR, file_name)
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            return {"content": file.read()}
+    except FileNotFoundError:
+        return {"error": f"'{file_name}' does not exist. Call list_files to see the correct file names and their folder."}
+    except (IsADirectoryError, PermissionError):
+        return {"error": f"'{file_name}' is a folder, not a file. Use list_files with that folder name to see what's inside it."}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def terminate(message: str) -> str:
+    """Ends the loop. Whatever message is passed in gets shown to the user."""
+    return message
+
+
+tool_functions = {
+    "list_files": list_files,
+    "read_file": read_file,
+    "terminate": terminate,
+}
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "Lists files in the project folder, or inside a specific subfolder if one is given.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Optional. A subfolder name to look inside. Leave blank to list the top-level folder."
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Reads the content of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {
+                        "type": "string",
+                        "description": "The name of the file to read, e.g. 'subfolder/file.py'."
+                    }
+                },
+                "required": ["file_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminate",
+            "description": "Ends the agent loop and provides a summary of the task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Summary message to return to the user."
+                    }
+                },
+                "required": ["message"]
+            }
+        }
+    }
+]
+
+agent_rules = [{
+    "role": "system",
+    "content": """
+You are an AI agent that can perform tasks by using available tools.
+
+If a user asks about files, documents, or content, first list the files before reading them.
+
+When you are done, call the "terminate" tool with a summary message.
+"""
+}]
+
+
+def preview(value, limit=300):
+    """Shorten long text so debug prints stay readable in the terminal."""
+    text = str(value)
+    if len(text) > limit:
+        return text[:limit] + f"... [truncated — {len(text)} characters total]"
+    return text
+
+
+max_iterations = 10
+user_task = input("What would you like me to do? ")
+memory: List[Dict] = [{"role": "user", "content": user_task}]
+
+iterations = 0
+while iterations < max_iterations:
+    prompt = agent_rules + memory
+
+    print("Agent thinking...")
+    response = completion(
+        model="gemini/gemini-flash-latest",
+        messages=prompt,
+        tools=tools
+    )
+
+    message = response.choices[0].message  # type: ignore
+
+    if not message.tool_calls:
+        print(f"Agent response: {message.content}")
+        break
+
+    tool_call = message.tool_calls[0]
+    tool_name = tool_call.function.name
+    tool_args = json.loads(tool_call.function.arguments)
+
+    print(f"Agent wants to call: {tool_name}({tool_args})")
+
+    if tool_name not in tool_functions:
+        result = {"error": f"Unknown tool: {tool_name}"}
+    else:
+        try:
+            output = tool_functions[tool_name](**tool_args)
+            result = output if isinstance(output, dict) else {"result": output}
+        except Exception as e:
+            result = {"error": f"Error executing {tool_name}: {str(e)}"}
+
+    print(f"Action result: {preview(result)}")
+
+    memory.append({
+        "role": "assistant",
+        "content": message.content,
+        "tool_calls": [{
+            "id": tool_call.id,
+            "type": "function",
+            "function": {
+                "name": tool_call.function.name,
+                "arguments": tool_call.function.arguments
+            }
+        }]
+    })
+    memory.append({
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "content": json.dumps(result)
+    })
+
+    if tool_name == "terminate":
+        print(tool_args["message"])
+        break
+
+    iterations += 1
