@@ -22,13 +22,22 @@ BLOCKED_FILES = {".env"}
 def safe_path(file_name: str) -> str:
     """
     Resolves `file_name` relative to TARGET_DIR and verifies the result
-    is still actually inside TARGET_DIR. This blocks both path
-    traversal (e.g. "../../secrets.txt") and absolute paths that would
-    otherwise let the agent escape the intended folder entirely.
+    is still actually inside TARGET_DIR. This blocks path traversal
+    (e.g. "../../secrets.txt"), absolute paths that would otherwise
+    let the agent escape the intended folder entirely, AND symbolic
+    links inside the project folder that point somewhere else.
+
+    Uses realpath() rather than abspath(): abspath() only cleans up
+    the path string (resolving "..", making it absolute) without
+    touching the filesystem, so a symlink inside the project folder
+    that points outside it would pass an abspath()-based check even
+    though actually opening it would read/write outside the sandbox.
+    realpath() follows any symlinks to their real target first, so
+    the containment check runs against where the path actually leads.
     Raises ValueError if the resulting path is outside TARGET_DIR.
     """
-    candidate = os.path.abspath(os.path.join(TARGET_DIR, file_name))
-    target_root = os.path.abspath(TARGET_DIR)
+    candidate = os.path.realpath(os.path.join(TARGET_DIR, file_name))
+    target_root = os.path.realpath(TARGET_DIR)
     try:
         common = os.path.commonpath([candidate, target_root])
     except ValueError:
