@@ -6,14 +6,42 @@ load_dotenv(find_dotenv())
 from litellm import completion
 from typing import List, Dict
 
+# BASE_DIR = the folder this script itself lives in — this repo's root.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TARGET_DIR = os.path.dirname(BASE_DIR)
+
+# TARGET_DIR = the folder the agent is allowed to browse.
+TARGET_DIR = BASE_DIR
+
+# Files the agent is never allowed to read, no matter what it's asked.
+# Compared case-insensitively, since Windows filesystems are.
 BLOCKED_FILES = {".env"}
+
+
+def safe_path(file_name: str) -> str:
+    """
+    Resolves `file_name` relative to TARGET_DIR and verifies the result
+    is still actually inside TARGET_DIR. This blocks both path
+    traversal (e.g. "../../secrets.txt") and absolute paths that would
+    otherwise let the agent escape the intended folder entirely.
+    Raises ValueError if the resulting path is outside TARGET_DIR.
+    """
+    candidate = os.path.abspath(os.path.join(TARGET_DIR, file_name))
+    target_root = os.path.abspath(TARGET_DIR)
+    try:
+        common = os.path.commonpath([candidate, target_root])
+    except ValueError:
+        raise ValueError("That path is outside the allowed folder.")
+    if common != target_root:
+        raise ValueError("That path is outside the allowed folder.")
+    return candidate
 
 
 def list_files(directory: str = "") -> Dict:
     """Lists files inside the project folder, or a subfolder of it."""
-    path = os.path.join(TARGET_DIR, directory) if directory else TARGET_DIR
+    try:
+        path = safe_path(directory) if directory else TARGET_DIR
+    except ValueError as e:
+        return {"error": str(e)}
     try:
         return {"files": os.listdir(path)}
     except Exception as e:
@@ -21,11 +49,16 @@ def list_files(directory: str = "") -> Dict:
 
 
 def read_file(file_name: str) -> Dict:
-    """Reads a file's contents. Refuses to read blocked files like .env."""
-    if os.path.basename(file_name) in BLOCKED_FILES:
+    """Reads a file's contents. Refuses to read blocked files like .env,
+    and refuses to read anything outside the project folder entirely."""
+    if os.path.basename(file_name).lower() in BLOCKED_FILES:
         return {"error": "Reading this file is not permitted."}
 
-    file_path = os.path.join(TARGET_DIR, file_name)
+    try:
+        file_path = safe_path(file_name)
+    except ValueError as e:
+        return {"error": str(e)}
+
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             return {"content": file.read()}
@@ -179,7 +212,9 @@ while iterations < max_iterations:
     })
 
     if tool_name == "terminate":
-        print(tool_args["message"])
+        # .get() with a fallback so a "terminate" call missing the
+        # "message" argument doesn't crash with an uncaught KeyError.
+        print(tool_args.get("message", "Task complete."))
         break
 
     iterations += 1

@@ -6,14 +6,38 @@ load_dotenv(find_dotenv())  # this line reads your .env file and loads GEMINI_AP
 from litellm import completion
 from typing import List, Dict
 
-# BASE_DIR = the folder this script itself lives in
+# BASE_DIR = the folder this script itself lives in — this repo's root.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# TARGET_DIR = one folder up from that = the project root
-TARGET_DIR = os.path.dirname(BASE_DIR)
+# TARGET_DIR = the folder the agent is allowed to browse. It's kept as
+# its own variable (rather than using BASE_DIR everywhere) so it's easy
+# to point the agent at a different folder later if needed.
+TARGET_DIR = BASE_DIR
 
 # Files the agent is never allowed to read, no matter what it's asked.
+# Compared case-insensitively, since Windows filesystems are.
 BLOCKED_FILES = {".env"}
+
+
+def safe_path(file_name: str) -> str:
+    """
+    Resolves `file_name` relative to TARGET_DIR and verifies the result
+    is still actually inside TARGET_DIR. This blocks both path
+    traversal (e.g. "../../secrets.txt") and absolute paths that would
+    otherwise let the agent escape the intended folder entirely.
+    Raises ValueError if the resulting path is outside TARGET_DIR.
+    """
+    candidate = os.path.abspath(os.path.join(TARGET_DIR, file_name))
+    target_root = os.path.abspath(TARGET_DIR)
+    try:
+        common = os.path.commonpath([candidate, target_root])
+    except ValueError:
+        # Raised on Windows if the paths are on different drives —
+        # definitely outside the allowed folder.
+        raise ValueError("That path is outside the allowed folder.")
+    if common != target_root:
+        raise ValueError("That path is outside the allowed folder.")
+    return candidate
 
 
 def extract_markdown_block(response: str, block_type: str = "json") -> str:
@@ -80,11 +104,14 @@ def parse_action(response: str) -> Dict:
 
 def list_files(directory: str = "") -> List[str]:
     """
-    A "tool" the agent can use. Lists every file in the current folder,
+    A "tool" the agent can use. Lists every file in the project folder,
     or a subfolder of it. The AI does NOT run this code itself — it can
     only ask us (the program) to run it on its behalf.
     """
-    path = os.path.join(TARGET_DIR, directory) if directory else TARGET_DIR
+    try:
+        path = safe_path(directory) if directory else TARGET_DIR
+    except ValueError as e:
+        return [f"Error: {str(e)}"]
     try:
         return os.listdir(path)
     except Exception as e:
@@ -94,13 +121,18 @@ def list_files(directory: str = "") -> List[str]:
 def read_file(file_name: str) -> str:
     """
     Another tool: opens a file and returns its text content. Refuses to
-    read blocked files like .env, and never lets the program crash if
-    something goes wrong.
+    read blocked files like .env, refuses to read outside the project
+    folder entirely, and never lets the program crash if something
+    goes wrong.
     """
-    if os.path.basename(file_name) in BLOCKED_FILES:
+    if os.path.basename(file_name).lower() in BLOCKED_FILES:
         return "Error: reading this file is not permitted."
 
-    file_path = os.path.join(TARGET_DIR, file_name)
+    try:
+        file_path = safe_path(file_name)
+    except ValueError as e:
+        return f"Error: {str(e)}"
+
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             return file.read()
@@ -205,15 +237,24 @@ while iterations < max_iterations:
     result = "Action executed"
 
     # STEP 4 — Look at which tool the AI asked for, and actually run it.
+    # .get() is used everywhere args are read, with a fallback, so a
+    # response missing an expected argument produces a normal error
+    # instead of an uncaught KeyError crash.
     if action["tool_name"] == "list_files":
         directory = action["args"].get("directory", "")
         result = {"result": list_files(directory)}
     elif action["tool_name"] == "read_file":
-        result = {"result": read_file(action["args"]["file_name"])}
+        file_name = action["args"].get("file_name")
+        if not file_name:
+            result = {"error": "Missing required argument 'file_name'."}
+        else:
+            result = {"result": read_file(file_name)}
     elif action["tool_name"] == "error":
-        result = {"error": action["args"]["message"]}
+        result = {"error": action["args"].get("message", "Unknown error.")}
     elif action["tool_name"] == "terminate":
-        print(action["args"]["message"])
+        # The AI has decided the task is finished. Print its final
+        # message and exit the loop completely.
+        print(action["args"].get("message", "Task complete."))
         break
     else:
         result = {"error": "Unknown action: " + action["tool_name"]}
@@ -226,9 +267,5 @@ while iterations < max_iterations:
         {"role": "assistant", "content": response},
         {"role": "user", "content": json.dumps(result)}
     ])
-
-    # STEP 6 — Check again whether the AI wanted to stop.
-    if action["tool_name"] == "terminate":
-        break
 
     iterations += 1
